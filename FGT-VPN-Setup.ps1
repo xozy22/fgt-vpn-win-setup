@@ -47,7 +47,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Script:Version = '3.0'
+$Script:Version = '3.0.1'
 $Script:Actions = @($Action -split '[,; ]+' | Where-Object { $_ })
 $valid = 'Menu','Wizard','Help','Settings','Certs','Fgt','FgtRemove','Client','Package','Clients','Peers','Revoke','Status','Uninstall','Purge'
 foreach ($a in $Script:Actions) { if ($valid -notcontains $a) { Write-Host "Unbekannte Aktion: $a (erlaubt: $($valid -join ', '))" -ForegroundColor Red; exit 2 } }
@@ -946,6 +946,12 @@ function Confirm-SshHostKey([string]$SshExe, [string]$HostName, [int]$Port) {
     $sshDir = Join-Path $HOME '.ssh'
     $known  = Join-Path $sshDir 'known_hosts'
     $spec   = if ($Port -eq 22) { $HostName } else { "[$HostName]:$Port" }
+    # Windows PowerShell 5.1 wertet jede stderr-Zeile nativer Programme als Fehler; mit 'Stop'
+    # bricht dann z. B. ssh-keyscan ab (es schreibt "# host:22 SSH-2.0-..." auf stderr).
+    $ErrorActionPreference = 'Continue'
+    foreach ($exe in @($scan, $keygen)) {
+        if (-not (Test-Path $exe)) { Write-Err2 "$(Split-Path $exe -Leaf) fehlt neben ssh.exe ($dir)."; return $false }
+    }
 
     if (Test-Path $known) {
         $null = & $keygen -F $spec -f $known 2>$null
@@ -954,7 +960,9 @@ function Confirm-SshHostKey([string]$SshExe, [string]$HostName, [int]$Port) {
     if ($Script:Auto) { Write-Err2 'Host-Key unbekannt - im Auto-Modus wird kein neuer Key akzeptiert.'; return $false }
 
     Write-Info 'Lese Host-Key der FortiGate ...'
-    $keys = & $scan -T 10 -p $Port $HostName 2>$null | Where-Object { $_ -and $_ -notmatch '^#' }
+    $keys = @()
+    try { $keys = @(& $scan -T 10 -p $Port $HostName 2>$null | ForEach-Object { "$_" } | Where-Object { $_ -match '^\S+ (ssh-|ecdsa-)\S+ \S+' }) }
+    catch { Write-Err2 ("ssh-keyscan: " + ($_.Exception.Message -replace '[\r\n]+', ' ')); return $false }
     if (-not $keys) { Write-Err2 "Kein Host-Key von ${HostName}:$Port erhalten (SSH erreichbar und erlaubt?)."; return $false }
     $tmpKeys = Join-Path $env:TEMP ("fgtvpn-keys-{0}.txt" -f [guid]::NewGuid().ToString('N'))
     try {
@@ -962,11 +970,29 @@ function Confirm-SshHostKey([string]$SshExe, [string]$HostName, [int]$Port) {
         Write-Info 'Fingerprints des Host-Keys:'
         & $keygen -l -f $tmpKeys 2>$null | ForEach-Object { Write-Host "      $_" -ForegroundColor White }
         if (-not (Read-YesNo 'Diesem Host-Key vertrauen und speichern?' $false)) { return $false }
-        $null = New-Item -ItemType Directory -Path $sshDir -Force
-        Add-Content -Path $known -Value $keys -Encoding ASCII
+        $null = New-Item -ItemType Directory -Path $sshDir -Force -ErrorAction Stop
+        Add-Content -Path $known -Value $keys -Encoding ASCII -ErrorAction Stop
         Write-Ok "Host-Key gespeichert ($known)"
         return $true
     } finally { Remove-Item $tmpKeys -Force -ErrorAction SilentlyContinue }
+}
+
+function Initialize-FgtSsh {
+    # ssh.exe pruefen und Host-Key bestaetigen. Rueckgabe: Pfad zu ssh.exe, oder $null = CLI-Datei verwenden.
+    $s = $Script:Settings
+    while ($true) {
+        $ssh = $null; $ok = $false
+        try {
+            $ssh = Test-SshClient
+            if ($ssh) { $ok = Confirm-SshHostKey -SshExe $ssh -HostName $s.FgtHost -Port ([int]$s.FgtPort) }
+        } catch { Write-Err2 ($_.Exception.Message -replace '[\r\n]+', ' ') }
+        if ($ok) { return $ssh }
+        if ($Script:Auto) { throw 'SSH-Vorbereitung fehlgeschlagen (Auto-Modus).' }
+        Write-Warn2 'Die SSH-Verbindung kann nicht sicher vorbereitet werden.'
+        $a = Read-Choice '1 = erneut versuchen, 2 = stattdessen CLI-Datei speichern, 3 = Abbrechen' @('1','2','3') '2'
+        if ($a -eq '2') { return $null }
+        if ($a -eq '3') { throw 'Abbruch durch Benutzer.' }
+    }
 }
 
 function Invoke-FgtCli {
@@ -1240,10 +1266,8 @@ function Invoke-FgtRemove {
 
     $mode = Read-Choice '1 = per SSH, 2 = nur als CLI-Datei speichern' @('1','2') '1'
     $ssh = $null; $names = @(); $polMap = @{}
+    if ($mode -eq '1') { $ssh = Initialize-FgtSsh; if (-not $ssh) { $mode = '2' } }
     if ($mode -eq '1') {
-        $ssh = Test-SshClient
-        if (-not $ssh) { return }
-        if (-not (Confirm-SshHostKey -SshExe $ssh -HostName $s.FgtHost -Port ([int]$s.FgtPort))) { throw 'Abbruch: Host-Key nicht bestaetigt.' }
         $q = Invoke-FgtQuery -SshExe $ssh -Purpose '1/2 Bestand abfragen und sichern'
         $polMap = $q.PolicyMap; $names = $q.Names
     } else {
@@ -1312,6 +1336,8 @@ function Invoke-FgtPeers {
     Write-Info ("Freizuschalten: {0}" -f $(if ($active.Count) { ($active | ForEach-Object { $_.Name }) -join ', ' } else { '(keine)' }))
 
     $mode = Read-Choice '1 = per SSH, 2 = nur als CLI-Datei speichern' @('1','2') '1'
+    $ssh = $null
+    if ($mode -eq '1') { $ssh = Initialize-FgtSsh; if (-not $ssh) { $mode = '2' } }
     $c = New-Object System.Collections.Generic.List[string]
     if ($s.Vdom) { $c.Add('config vdom'); $c.Add("edit `"$($s.Vdom)`"") }
     if ($mode -eq '2') {
@@ -1324,9 +1350,6 @@ function Invoke-FgtPeers {
         Write-Ok "CLI-Datei: $file (gesperrte Peers bitte zusaetzlich unter config user peer loeschen)"
         return
     }
-    $ssh = Test-SshClient
-    if (-not $ssh) { return }
-    if (-not (Confirm-SshHostKey -SshExe $ssh -HostName $s.FgtHost -Port ([int]$s.FgtPort))) { throw 'Abbruch: Host-Key nicht bestaetigt.' }
     $q = Invoke-FgtQuery -SshExe $ssh -Purpose '1/2 Bestand abfragen und sichern' -WithGateways:$Flush
     if ($q.Names -notcontains $p1) { throw "Phase1 '$p1' gibt es auf der FortiGate nicht - zuerst Menuepunkt 2 ausfuehren." }
     $peer = New-FgtPeerLines -CaName $caName -Existing $q.Names -KnowExisting
@@ -1426,6 +1449,8 @@ function Invoke-Fgt {
     }
 
     $mode = Read-Choice '1 = per SSH uebertragen, 2 = nur als CLI-Datei speichern' @('1','2') '1'
+    $ssh = $null
+    if ($mode -eq '1') { $ssh = Initialize-FgtSsh; if (-not $ssh) { $mode = '2' } }
     if ($mode -eq '2') {
         $cfg = New-FgtConfig -CaName $caName -CaPem $caPem -SrvName $srvName -SrvCertPem $srvCert -SrvKeyPem $srvKey -EapUser $eapUser -EapPass $eapPass
         $file = Join-Path $Script:Root "fgt-config-$($s.P1Name).txt"
@@ -1434,10 +1459,6 @@ function Invoke-Fgt {
         Write-Warn2 'Enthaelt den privaten Schluessel - nach dem Einfuegen loeschen!'
         return
     }
-
-    $ssh = Test-SshClient
-    if (-not $ssh) { return }
-    if (-not (Confirm-SshHostKey -SshExe $ssh -HostName $s.FgtHost -Port ([int]$s.FgtPort))) { throw 'Abbruch: Host-Key nicht bestaetigt.' }
 
     # 1/2: Bestand abfragen und lokal sichern (vorhandene Policies, Reihenfolge, eigene Objekte)
     $q = Invoke-FgtQuery -SshExe $ssh -Purpose '1/2 Bestand abfragen und sichern'
@@ -1964,7 +1985,7 @@ while ($true) {
             default { Write-Warn2 'Ungueltige Auswahl.' }
         }
     } catch {
-        Write-Err2 $_.Exception.Message
+        Write-Err2 ($_.Exception.Message -replace '[\r\n]+', ' ')
         if ($_.InvocationInfo) { Write-Host "         ($($_.InvocationInfo.PositionMessage.Split("`n")[0]))" -ForegroundColor DarkGray }
     }
     Wait-Enter
