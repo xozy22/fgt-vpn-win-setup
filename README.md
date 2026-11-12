@@ -18,6 +18,7 @@ Ein einzelnes PowerShell-Skript richtet den in Windows 11 eingebauten VPN-Client
   - Peer-Gruppe (ein Peer je Client)
   - Adressen, Phase1 und Phase2
   - Policies mit vollem Logging
+- **Interfaces von der FortiGate lesen:** In den Einstellungen liest das Skript auf Wunsch Interfaces, Zonen und SD-WAN-Zonen per SSH (nur lesend) und zeigt sie zur Auswahl an. Ohne SSH gibst du die Namen wie bisher von Hand ein.
 - **Split oder Full Tunnel**, optional Policies in **beide Richtungen** (LAN → VPN-Clients)
 - **Clients sperren:** Ein Peer je PC (CN = Rechnername). Beim Sperren werden Peer und laufende Tunnel entfernt.
 - **Client-Pakete für andere PCs:** Der VPN-Client braucht keinen Zugang zur FortiGate. Jedes Paket hat ein eigenes Zufallspasswort.

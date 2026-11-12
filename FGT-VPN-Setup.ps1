@@ -47,7 +47,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Script:Version = '3.0.1'
+$Script:Version = '3.1'
 $Script:Actions = @($Action -split '[,; ]+' | Where-Object { $_ })
 $valid = 'Menu','Wizard','Help','Settings','Certs','Fgt','FgtRemove','Client','Package','Clients','Peers','Revoke','Status','Uninstall','Purge'
 foreach ($a in $Script:Actions) { if ($valid -notcontains $a) { Write-Host "Unbekannte Aktion: $a (erlaubt: $($valid -join ', '))" -ForegroundColor Red; exit 2 } }
@@ -444,14 +444,33 @@ function Edit-Settings {
 
     Write-Step 'FortiGate'
     do { $s.P1Name = Read-Default 'Name Phase1 (max. 13 Zeichen)' $s.P1Name } until ($s.P1Name -match '^[A-Za-z0-9_-]{1,13}$')
-    $s.WanIf = Read-Default 'WAN-Interface' $s.WanIf
-    $s.LanIf = Read-Default 'Ziel-Interface(s) fuer die Policy (kommagetrennt)' $s.LanIf
     $s.Vdom  = Read-Default 'VDOM (leer = VDOMs nicht aktiv)' $s.Vdom
     if ($s.AuthMode -eq 'Cert') { $s.CaName = Read-Default 'Namenspraefix der CA auf der FortiGate' $s.CaName }
     else { $s.UserGroup = Read-Default 'Benutzergruppe auf der FortiGate' $s.UserGroup }
     $s.FgtHost = Read-Default 'Management-IP der FortiGate fuer SSH' $(if ($s.FgtHost) { $s.FgtHost } else { $s.Fqdn })
     $s.FgtPort = Read-Default 'SSH-Port' $s.FgtPort
     $s.FgtUser = Read-Default 'Admin-Benutzer' $s.FgtUser
+
+    Write-Step 'Interfaces'
+    $ifs = $null
+    if ($s.FgtHost -and -not $Script:Auto -and (Read-YesNo 'Interfaces per SSH von der FortiGate lesen (nur lesend)?' $true)) {
+        $ifs = Get-FgtInterfaces
+        if ($ifs -and -not $ifs.Count) { Write-Warn2 'Keine passenden Interfaces gefunden.'; $ifs = $null }
+    }
+    if ($ifs) {
+        Show-FgtInterfaces $ifs
+        $names = @($ifs | ForEach-Object { $_.Name })
+        $defWan = if ($names -contains $s.WanIf) { $s.WanIf } else { (@($ifs | Where-Object { $_.Role -eq 'wan' -and -not $_.Down }) + @($ifs | Where-Object { $_.Role -eq 'wan' }) + @([pscustomobject]@{ Name = $s.WanIf }))[0].Name }
+        $s.WanIf = Select-FgtInterface -List $ifs -Prompt 'WAN-Interface (Nummer oder Name)' -Default $defWan
+        $curLan = @(($s.LanIf -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $defLan = if ($curLan.Count -and -not @($curLan | Where-Object { $names -notcontains $_ }).Count) { $curLan -join ',' }
+                  else { $l = @($ifs | Where-Object { $_.Role -eq 'lan' -and -not $_.Down } | ForEach-Object { $_.Name }); if ($l.Count) { $l -join ',' } else { $s.LanIf } }
+        $s.LanIf = Select-FgtInterface -List $ifs -Prompt 'Ziel-Interface(s) fuer die Policy (Nummern oder Namen, kommagetrennt)' -Default $defLan -Multi
+        if (@($s.LanIf -split ',') -contains $s.WanIf) { Write-Warn2 'WAN-Interface ist auch als Ziel-Interface gewaehlt - bitte pruefen.' }
+    } else {
+        $s.WanIf = Read-Default 'WAN-Interface' $s.WanIf
+        $s.LanIf = Read-Default 'Ziel-Interface(s) fuer die Policy (kommagetrennt)' $s.LanIf
+    }
 
     Save-Settings
     Write-Ok "Gespeichert: $Script:SettingsFile"
@@ -978,7 +997,8 @@ function Confirm-SshHostKey([string]$SshExe, [string]$HostName, [int]$Port) {
 }
 
 function Initialize-FgtSsh {
-    # ssh.exe pruefen und Host-Key bestaetigen. Rueckgabe: Pfad zu ssh.exe, oder $null = CLI-Datei verwenden.
+    # ssh.exe pruefen und Host-Key bestaetigen. Rueckgabe: Pfad zu ssh.exe, oder $null = Rueckfall (CLI-Datei bzw. manuell).
+    param([string]$Fallback = 'stattdessen CLI-Datei speichern')
     $s = $Script:Settings
     while ($true) {
         $ssh = $null; $ok = $false
@@ -989,9 +1009,125 @@ function Initialize-FgtSsh {
         if ($ok) { return $ssh }
         if ($Script:Auto) { throw 'SSH-Vorbereitung fehlgeschlagen (Auto-Modus).' }
         Write-Warn2 'Die SSH-Verbindung kann nicht sicher vorbereitet werden.'
-        $a = Read-Choice '1 = erneut versuchen, 2 = stattdessen CLI-Datei speichern, 3 = Abbrechen' @('1','2','3') '2'
+        $a = Read-Choice "1 = erneut versuchen, 2 = $Fallback, 3 = Abbrechen" @('1','2','3') '2'
         if ($a -eq '2') { return $null }
         if ($a -eq '3') { throw 'Abbruch durch Benutzer.' }
+    }
+}
+
+function Split-FgtSegments([string]$Raw) {
+    # CLI-Ausgabe an den Prompts ("HOST # ", "HOST (global) # ") in Abschnitte je Befehl zerlegen
+    $pm = [regex]::Matches($Raw, '(?m)^[A-Za-z0-9._-]+ (?:\([^)]*\) )?# ?')
+    $segs = @()
+    for ($i = 0; $i -lt $pm.Count; $i++) {
+        $st = $pm[$i].Index + $pm[$i].Length
+        $en = if ($i + 1 -lt $pm.Count) { $pm[$i + 1].Index } else { $Raw.Length }
+        $segs += $Raw.Substring($st, $en - $st)
+    }
+    return ,$segs
+}
+
+function ConvertFrom-FgtEditBlocks([string]$Text, [int]$Indent = 4) {
+    # "edit <name>" auf Ebene $Indent mit ihren "set"-Zeilen eine Ebene tiefer -> Liste von Hashtables
+    $res = New-Object System.Collections.Generic.List[object]
+    $cur = $null
+    $eRx = '^' + (' ' * $Indent) + 'edit "?([^"]+)"?\s*$'
+    $sRx = '^' + (' ' * ($Indent + 4)) + 'set (\S+) ?(.*)$'
+    $nRx = '^' + (' ' * $Indent) + 'next\s*$'
+    foreach ($l in ($Text -split "`n")) {
+        if ($l -match $eRx) { $cur = @{ '_name' = $Matches[1] }; $res.Add($cur); continue }
+        if ($cur -and $l -match $sRx) { $cur[$Matches[1]] = $Matches[2].Trim(); continue }
+        if ($l -match $nRx) { $cur = $null }
+    }
+    return ,$res
+}
+
+function Get-FgtInterfaces {
+    # Liest Interfaces, Zonen und SD-WAN-Zonen per SSH. Rueckgabe: Liste oder $null (Rueckfall auf manuelle Eingabe).
+    $s = $Script:Settings
+    $ssh = Initialize-FgtSsh -Fallback 'Interfaces manuell eingeben'
+    if (-not $ssh) { return $null }
+    $lines = @()
+    if ($s.Vdom) { $lines += @('config global', 'show system interface', 'end', 'config vdom', "edit `"$($s.Vdom)`"", 'show system zone', 'show system sdwan', 'end') }
+    else         { $lines += @('show system interface', 'show system zone', 'show system sdwan') }
+    try { $raw = Invoke-FgtCli -SshExe $ssh -Lines $lines -Purpose 'Interfaces lesen (nur lesend)' }
+    catch { Write-Err2 ($_.Exception.Message -replace '[\r\n]+', ' '); return $null }
+
+    $segs = @(Split-FgtSegments $raw)
+    $find = { param($head) ($segs | Where-Object { $_ -match "(?m)^config $head\s*$" } | Select-Object -First 1) }
+    $ifText = & $find 'system interface'
+    if (-not $ifText) { Write-Err2 'Die Interface-Liste konnte nicht gelesen werden (Rechte des Admin-Profils?).'; return $null }
+    $zoneText = & $find 'system zone'
+    $sdText   = & $find 'system sdwan'
+
+    $list = New-Object System.Collections.Generic.List[object]
+    $members = @{}
+    foreach ($z in (ConvertFrom-FgtEditBlocks "$zoneText")) {
+        foreach ($m in ([regex]::Matches("$($z['interface'])", '"([^"]+)"'))) { $members[$m.Groups[1].Value] = "Zone $($z._name)" }
+        $list.Add([pscustomobject]@{ Name = $z._name; Type = 'zone'; Role = ''; Ip = ''; Alias = "$($z['description'])".Trim('"'); Down = $false })
+    }
+    if ("$sdText" -match '(?m)^    set status enable') {
+        $zm = [regex]::Match("$sdText", '(?ms)^    config zone\s*$(.*?)^    end\s*$')
+        if ($zm.Success) {
+            foreach ($z in (ConvertFrom-FgtEditBlocks $zm.Groups[1].Value 8)) {
+                $list.Add([pscustomobject]@{ Name = $z._name; Type = 'sdwan-zone'; Role = 'wan'; Ip = ''; Alias = ''; Down = $false })
+            }
+        }
+        $mm = [regex]::Match("$sdText", '(?ms)^    config members\s*$(.*?)^    end\s*$')
+        if ($mm.Success) {
+            foreach ($m in (ConvertFrom-FgtEditBlocks $mm.Groups[1].Value 8)) { if ($m['interface']) { $members[$m['interface'].Trim('"')] = 'SD-WAN' } }
+        }
+    }
+    foreach ($i in (ConvertFrom-FgtEditBlocks "$ifText")) {
+        $n = $i._name
+        if ($s.Vdom -and "$($i['vdom'])".Trim('"') -ne $s.Vdom) { continue }
+        if ($n -match '^(ssl|naf|l2t)\.' -or $n -eq $s.P1Name -or $members.ContainsKey($n)) { continue }
+        $ip = ''
+        if ($i['ip'] -match '^(\d+\.\d+\.\d+\.\d+) (\d+\.\d+\.\d+\.\d+)$') { $ip = "$($Matches[1])/$(ConvertTo-PrefixLength $Matches[2])" }
+        elseif ($i['mode'] -in @('dhcp', 'pppoe')) { $ip = $i['mode'] }
+        $list.Add([pscustomobject]@{ Name = $n; Type = "$(if ($i['type']) { $i['type'] } else { 'physical' })"; Role = "$($i['role'])"
+                                     Ip = $ip; Alias = "$($i['alias'])".Trim('"'); Down = ($i['status'] -eq 'down') })
+    }
+    if ($members.Count) { Write-Info ("Nicht waehlbar (Mitglied einer Zone/SD-WAN): {0}" -f (($members.Keys | Sort-Object) -join ', ')) }
+    return ,$list
+}
+
+function ConvertTo-PrefixLength([string]$Mask) {
+    $bits = 0
+    foreach ($o in $Mask.Split('.')) { $bits += ([Convert]::ToString([int]$o, 2) -replace '0', '').Length }
+    return $bits
+}
+
+function Show-FgtInterfaces($List) {
+    Write-Line
+    Write-BoxText ('{0,-4}{1,-18}{2,-12}{3,-6}{4,-20}{5}' -f 'NR', 'NAME', 'TYP', 'ROLLE', 'IP', 'ALIAS') 'Cyan'
+    for ($k = 0; $k -lt $List.Count; $k++) {
+        $i = $List[$k]
+        $alias = if ($i.Down) { ("$($i.Alias) (down)").Trim() } else { $i.Alias }
+        $line = '{0,-4}{1,-18}{2,-12}{3,-6}{4,-20}{5}' -f ($k + 1), $i.Name, $i.Type, $i.Role, $i.Ip, $alias
+        if ($line.Length -gt $Script:W - 4) { $line = $line.Substring(0, $Script:W - 4) }
+        Write-BoxText $line $(if ($i.Down) { 'DarkGray' } elseif ($i.Role -eq 'wan') { 'Yellow' } else { 'White' })
+    }
+    Write-Line
+}
+
+function Select-FgtInterface {
+    # Auswahl per Nummer oder Name, mehrere kommagetrennt (-Multi). Unbekannte Namen nur nach Rueckfrage.
+    param($List, [string]$Prompt, [string]$Default, [switch]$Multi)
+    $names = @($List | ForEach-Object { $_.Name })
+    while ($true) {
+        $v = Read-Default $Prompt $Default
+        $parts = @(($v -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        if (-not $parts.Count) { Write-Warn2 'Bitte mindestens ein Interface waehlen.'; continue }
+        if (-not $Multi -and $parts.Count -gt 1) { Write-Warn2 'Bitte genau ein Interface waehlen.'; continue }
+        $sel = @(); $bad = @()
+        foreach ($p in $parts) {
+            if ($p -match '^\d+$' -and [int]$p -ge 1 -and [int]$p -le $names.Count) { $sel += $names[[int]$p - 1] }
+            elseif ($names -contains $p) { $sel += $p }
+            else { $bad += $p; $sel += $p }
+        }
+        if ($bad.Count -and -not (Read-YesNo "Nicht in der Liste: $($bad -join ', ') - trotzdem verwenden?" $false)) { continue }
+        return (($sel | Select-Object -Unique) -join ',')
     }
 }
 
