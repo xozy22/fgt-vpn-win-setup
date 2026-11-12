@@ -1,0 +1,9 @@
+fgt-vpn-settings.json
+vpn-certs/
+fgt-backups/
+vpn-client-*/
+vpn-client-*.zip
+fgt-config-*.txt
+fgt-remove-*.txt
+fgt-peers-*.txt
+*.log
