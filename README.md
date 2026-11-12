@@ -41,8 +41,8 @@ Die ausführliche Bedienungsanleitung gibt es als PDF: **[docs/FGT-VPN-Setup-Bed
 
 ## Schnellstart (alles auf einem PC)
 
-1. `FGT-VPN-Setup.ps1` in einen eigenen Ordner legen.
-2. Rechtsklick auf die Datei und **„Mit PowerShell ausführen“** wählen, dann UAC bestätigen.
+1. `FGT-VPN-Setup.ps1` und `Start-FGT-VPN-Setup.cmd` in einen eigenen Ordner legen.
+2. **`Start-FGT-VPN-Setup.cmd` doppelklicken** und UAC bestätigen. Alternativ: Rechtsklick auf die `.ps1` und **„Mit PowerShell ausführen“**.
 3. Beim ersten Start führt der **Assistent (A)** durch die vier Schritte:
    1. **Einstellungen:** FortiGate-Adresse, interne Netze, IP-Pool, DNS, Interfaces, Tunnel-Modus
    2. **Zertifikate (3):** CA, Serverzertifikat, Client-Zertifikat für diesen PC
@@ -155,6 +155,16 @@ Das FortiGate-Passwort fragt `ssh.exe` immer selbst ab.
 - **EAP** (Benutzer/Passwort) funktioniert nur als Benutzer-VPN mit Anmeldedialog. Windows reicht EAP-Zugangsdaten bei `rasdial` nicht durch (Fehler 703). Always-On vor der Anmeldung geht nur mit Zertifikat.
 - **IPv6:** Der Tunnel ist nur IPv4. Im Full-Tunnel geht IPv6-Verkehr am Tunnel vorbei.
 - **DNS über den Tunnel:** Liegt der DNS-Server außerhalb der internen Netze, muss er hinter den Ziel-Interfaces der Policy erreichbar sein.
+
+## Fehler „Ausführung von Skripts ist deaktiviert“
+
+Die Windows-Ausführungsrichtlinie (Standard `Restricted`) blockiert das Skript, bevor es startet. Das Skript kann diesen Fehler daher nicht selbst abfangen. Lösungen, ohne die Richtlinie dauerhaft zu ändern:
+
+- `Start-FGT-VPN-Setup.cmd` verwenden, oder
+- Rechtsklick → „Mit PowerShell ausführen“, oder
+- in der Konsole: `powershell -ExecutionPolicy Bypass -File .\FGT-VPN-Setup.ps1`
+
+Ist die Richtlinie per Gruppenrichtlinie erzwungen (`Get-ExecutionPolicy -List` zeigt `MachinePolicy`/`UserPolicy`), hilft nur eine Ausnahme durch die IT oder eine signierte Skriptversion.
 
 ## Fehlercodes
 
